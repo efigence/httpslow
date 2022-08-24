@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/net/http2"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -71,6 +72,7 @@ func main() {
 		cli.BoolFlag{Name: "help, h", Usage: "show help"},
 		cli.BoolFlag{Name: "http1, 1", Usage: "use http 1.1"},
 		cli.BoolFlag{Name: "post, p", Usage: "post"},
+		cli.BoolFlag{Name: "slow, s", Usage: "use slow reader/writer"},
 		cli.StringFlag{
 			Name:   "url",
 			Value:  "http://127.0.0.1",
@@ -115,6 +117,20 @@ func (s SlowReader) Read(p []byte) (n int, err error) {
 
 }
 
+type RandReader struct {
+}
+
+func (s RandReader) Read(p []byte) (n int, err error) {
+	time.Sleep(time.Second)
+	if len(p) > 0 {
+		rand.Read(p[:len(p)-1])
+		return 1, nil
+	} else {
+		return 0, nil
+	}
+
+}
+
 func requester(c *cli.Context) {
 	concurrency := c.Int("concurrency")
 	url := c.String("url")
@@ -141,12 +157,19 @@ func requester(c *cli.Context) {
 	lastErr := time.Now().Unix()
 	lastErrLock := sync.Mutex{}
 	var gr func()
+	var reader io.Reader
+	if c.Bool("slow") {
+		log.Infof("SlowReader")
+		reader = &SlowReader{}
+	} else {
+		reader = &RandReader{}
+	}
 	if c.Bool("post") {
-		log.Infof("POST, slowReader")
+		log.Infof("POST")
 		gr = func() {
 			for {
 				url := c.String("url")
-				resp, err := client.Post(url, "text/plain", &SlowReader{})
+				resp, err := client.Post(url, "text/plain", reader)
 				_ = resp
 				_ = err
 				if err != nil {
@@ -165,17 +188,34 @@ func requester(c *cli.Context) {
 		}
 	} else {
 		log.Infof("GET")
-		gr = func() {
-			for {
-				url := c.String("url")
-				resp, err := client.Get(url)
-				_ = resp
-				_ = err
-				rate.UpdateNow()
+		if c.Bool("slow") {
+			gr = func() {
+				for {
+					buf := make([]byte, 1024)
+					url := c.String("url")
+					resp, err := client.Get(url)
+					for err != nil {
+						_, err = resp.Body.Read(buf)
+						time.Sleep(time.Second)
+					}
+					rate.UpdateNow()
+				}
+				wg.Done()
 			}
-			wg.Done()
+		} else {
+			gr = func() {
+				for {
+					url := c.String("url")
+					resp, err := client.Get(url)
+					_ = resp
+					_ = err
+					rate.UpdateNow()
+				}
+				wg.Done()
+			}
 		}
 	}
+	log.Infof("spawning %d concurrent connections", concurrency)
 	for i := 1; i <= concurrency; i++ {
 		wg.Add(1)
 		go gr()
